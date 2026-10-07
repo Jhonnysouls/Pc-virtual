@@ -1,0 +1,108 @@
+name: PC Virtual v3 - Windows 11 VM com RDP via Tailscale
+
+on:
+  workflow_dispatch:  # permite acionar manualmente na aba "Actions"
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600  # até 6 horas de execução
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Habilitar Remote Desktop e desativar NLA (se necessário)
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal ServerWinStationsRDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal ServerWinStationsRDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Remover regra antiga (se existir)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Permitir RDP na porta 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Reiniciar serviço RDP
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $charSet = @{
+            Upper   = [char[]](65..90)      # A-Z
+            Lower   = [char[]](97..122)     # a-z
+            Number  = [char[]](48..57)      # 0-9
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Salvar senha em arquivo temporário (apenas para debug; em produção, use secrets)
+          $password | Out-File -FilePath "$env:TEMP
+dp_password.txt" -Encoding utf8
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Conectar à Tailscale usando authkey dos secrets
+          & "$env:ProgramFilesTailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Aguardar IP ser atribuído
+          $tsIP = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $info = & "$env:ProgramFilesTailscale\tailscale.exe" ip -4
+            if ($info) {
+              $tsIP = $info.Trim()
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Falha ao obter IP da Tailscale"
+            exit 1
+          }
+
+          Write-Host "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          # Testar conectividade RDP
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
+          if (-not $testResult) {
+            Write-Warning "Porta 3389 não responde no IP da Tailscale (pode levar alguns segundos para abrir)"
+          }
+
+      - name: Show Connection Info
+        run: |
+          Write-Host "========================================"
+          Write-Host "PC Virtual pronto para acesso RDP"
+          Write-Host "IP Tailscale: ${{ env.TAILSCALE_IP }}"
+          Write-Host "Usuário: RDP"
+          Write-Host "Senha: (verifique o arquivo rdp_password.txt ou os logs acima)"
+          Write-Host "========================================"
+          Write-Host "No seu PC, instale a Tailscale, faça login na mesma rede e conecte-se via:"
+          Write-Host "  mstsc /v:${{ env.TAILSCALE_IP }}"
